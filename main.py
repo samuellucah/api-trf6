@@ -8,7 +8,7 @@ from typing import Any, Dict, List, Optional
 from fastapi import FastAPI, Query, HTTPException
 from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeoutError
 
-# Permite loops aninhados (essencial para FastAPI + Playwright)
+# Permite loops aninhados
 nest_asyncio.apply()
 
 # URL DO TRF6
@@ -29,36 +29,25 @@ def _norm(txt: str) -> str:
     return re.sub(r"\s+", " ", (txt or "")).strip()
 
 def sanitize_doc(doc: str) -> str:
-    """Remove tudo que não for número."""
     return re.sub(r"\D+", "", doc or "")
 
 # ===== Concurrency + Cache =====
-SEMA = asyncio.Semaphore(1)           # 1 request por vez (Playwright é pesado)
-CACHE_TTL = 300                       # 5 minutos
+SEMA = asyncio.Semaphore(1)
+CACHE_TTL = 300
 _cache: Dict[str, Dict[str, Any]] = {}
 
 app = FastAPI(title="PJe TRF6 - Consulta Pública")
 
-
-# ========= Helpers de página =========
+# ========= Helpers =========
 
 async def selecionar_tipo_documento_trf6(page, tipo: str):
-    """
-    Seleciona CPF ou CNPJ baseado no onclick do HTML fornecido:
-    onclick="mascaraDocumento('documentoParte', 'CNPJ')"
-    """
     tipo_str = "CNPJ" if tipo.lower() == "cnpj" else "CPF"
-    
-    # Procura input que tenha o onclick correspondente
-    # Ex: input[onclick*='CNPJ']
     selector = f"input[name='tipoMascaraDocumento'][onclick*='{tipo_str}']"
-
     frames = [page.main_frame] + page.frames
     for fr in frames:
         try:
             radios = fr.locator(selector)
             if await radios.count() > 0:
-                # Força o clique via JS para garantir, pois as vezes o label cobre
                 await radios.first.evaluate("el => el.click()")
                 await page.wait_for_timeout(500)
                 return
@@ -66,13 +55,7 @@ async def selecionar_tipo_documento_trf6(page, tipo: str):
             continue
 
 async def find_input_trf6(page):
-    """
-    Encontra o input específico do TRF6 pelo ID: fPP:dpDec:documentoParte
-    Como IDs com ':' precisam ser escapados em CSS, usamos [id='...'] ou escape.
-    """
-    # Seletor robusto por atributo ID exato
     selector = "[id='fPP:dpDec:documentoParte']"
-
     frames = [page.main_frame] + page.frames
     for fr in frames:
         try:
@@ -84,69 +67,35 @@ async def find_input_trf6(page):
     return None, None
 
 async def wait_spinner_or_delay(page):
-    """
-    Aguarda spinners do PJe (RichFaces/JSF status).
-    """
-    # RichFaces status normal
-    candidates = [
-        "[id*='status']", 
-        ".ui-widget-overlay", 
-        "img[src*='spinner']",
-        "div[id*='submitStatus']" # Comum em JSF/Seam
-    ]
-    
-    # Pequeno delay inicial para dar tempo do spinner aparecer
+    # Aguarda spinner sumir
+    candidates = ["[id*='status']", ".ui-widget-overlay", "img[src*='spinner']"]
     await page.wait_for_timeout(500)
-    
     for sel in candidates:
         try:
             loc = page.locator(sel).first
             if await loc.is_visible():
-                # Espera sumir
-                await loc.wait_for(state="hidden", timeout=25000)
+                await loc.wait_for(state="hidden", timeout=20000)
         except:
             pass
 
 async def open_process_popup(page, clickable):
     try:
-        async with page.expect_popup(timeout=20000) as pop:
-            # Tenta clicar. Se houver JS blocking, força via evaluate
+        async with page.expect_popup(timeout=15000) as pop:
             try:
-                await clickable.click(timeout=5000)
+                await clickable.click(timeout=3000)
             except:
                 await clickable.evaluate("el => el.click()")
-                
         popup = await pop.value
         await popup.wait_for_load_state("domcontentloaded")
         return popup
     except PlaywrightTimeoutError:
         return None
 
-# ... (Funções de extração extract_metadata, extract_movements, extract_partes_from_row 
-#      permanecem iguais, pois a estrutura interna do PJe costuma ser padrão) ...
-
-async def try_click_movements_tab(popup):
-    candidates = [
-        popup.get_by_role("tab", name=re.compile(r"Movimenta", re.I)),
-        popup.locator("text=/Movimenta(ç|c)ões/i"),
-        popup.locator("div[id*='divMovimentacao']"), # PJe antigo
-    ]
-    for c in candidates:
-        try:
-            if await c.count() > 0 and await c.first.is_visible():
-                await c.first.click(timeout=3000)
-                await popup.wait_for_timeout(800)
-                return
-        except:
-            pass
-
 async def extract_metadata(popup) -> Dict[str, Optional[str]]:
-    # Mesma lógica do anterior (genérica para PJe)
     try:
         body = await popup.locator("body").inner_text()
     except:
         return {}
-    
     lines = [_norm(ln) for ln in body.replace("\r", "").split("\n") if _norm(ln)]
     
     def find_value(keys: List[str]) -> Optional[str]:
@@ -172,30 +121,38 @@ async def extract_metadata(popup) -> Dict[str, Optional[str]]:
     }
 
 async def extract_movements(popup) -> List[str]:
-    await try_click_movements_tab(popup)
+    # Tenta clicar na aba
+    candidates = [
+        popup.get_by_role("tab", name=re.compile(r"Movimenta", re.I)),
+        popup.locator("text=/Movimenta(ç|c)ões/i"),
+    ]
+    for c in candidates:
+        try:
+            if await c.count() > 0 and await c.first.is_visible():
+                await c.first.click(timeout=2000)
+                await popup.wait_for_timeout(500)
+                break
+        except: pass
+
     texts = []
     seen = set()
-    # Seletores comuns de tabelas de movimentação PJe
     selectors = ["tbody[id*='tabelaMovimentacoes'] tr", "table[id*='movimentacao'] tr", ".rich-table-row"]
-    
     for sel in selectors:
         try:
             rows = popup.locator(sel)
             cnt = await rows.count()
             if cnt > 0:
-                for i in range(min(cnt, 20)):
+                for i in range(min(cnt, 15)):
                     t = _norm(await rows.nth(i).inner_text())
                     if t and t not in seen and not UNWANTED_RE.search(t):
                         seen.add(t)
                         texts.append(t)
                 break
-        except:
-            pass
+        except: pass
     return texts
 
 async def extract_partes_from_row(link) -> Optional[str]:
     try:
-        # PJe 1.x TRF costuma ser tabela richfaces
         row = link.locator("xpath=ancestor::tr[1]")
         row_text = await row.inner_text()
         return _norm(row_text)
@@ -224,44 +181,75 @@ async def scrape_pje(doc_digits: str, tipo: str) -> Dict[str, Any]:
         page = await context.new_page()
 
         try:
-            await page.goto(URL, wait_until="networkidle", timeout=60000)
+            await page.goto(URL, wait_until="domcontentloaded", timeout=60000)
             
-            # 1. Seleciona o Radio Button (CPF/CNPJ)
+            # 1. Seleciona Tipo
             await selecionar_tipo_documento_trf6(page, tipo)
 
-            # 2. Encontra o Input pelo ID específico
+            # 2. Input
             fr, doc_input = await find_input_trf6(page)
             if not doc_input:
                 raise Exception("campo_input_nao_encontrado")
 
-            # 3. Preenche
+            # 3. Preenche e força foco
             await doc_input.click()
             await doc_input.fill(doc_digits)
+            await page.wait_for_timeout(200)
+
+            # 4. Busca Botão de forma global (mais seguro)
+            # O ID contém ':', usamos seletor de atributo
+            btn_selector = "[id='fPP:searchProcessos']"
             
-            # 4. Clica no Botão Pesquisar (ID: fPP:searchProcessos)
-            # O ID contém ':', então usamos seletor de atributo para evitar erro de sintaxe CSS ou escape
-            search_btn = fr.locator("[id='fPP:searchProcessos']")
-            if await search_btn.count() > 0:
-                await search_btn.click(timeout=30000)
-            else:
+            # Tenta achar o botão no frame do input ou globalmente
+            btn = fr.locator(btn_selector) if fr else page.locator(btn_selector)
+            
+            clicked = False
+            if await btn.count() > 0:
+                try:
+                    await btn.first.click(timeout=5000)
+                    clicked = True
+                except:
+                    # Fallback JS
+                    await btn.first.evaluate("el => el.click()")
+                    clicked = True
+            
+            if not clicked:
                 await doc_input.press("Enter")
 
-            # Aguarda carregamento
-            await wait_spinner_or_delay(page)
-
-            # 5. Verifica Resultados
-            # TRF6/PJe antigo geralmente mostra tabela com classe rich-table ou id processTable
-            # Vamos procurar links que batam com o Regex do CNJ
-            proc_links = page.locator("a").filter(has_text=CNJ_RE)
+            # 5. Espera Ativa pelos Resultados (Pooling)
+            # Aguarda até 10 segundos aparecer algum link com regex CNJ ou texto de resultado
+            start_wait = time.time()
+            found_results = False
             
-            # Fallback: Se não achar links diretos, procura em células da tabela
-            if await proc_links.count() == 0:
-                # Procura texto na página para depuração
+            while (time.time() - start_wait) < 10:
+                # Verifica se spinner está rodando e espera
+                await wait_spinner_or_delay(page)
+                
+                # Procura links
+                proc_links = page.locator("a").filter(has_text=CNJ_RE)
+                count = await proc_links.count()
+                
+                if count > 0:
+                    found_results = True
+                    break
+                
+                # Verifica se apareceu aviso de "Nenhum registro"
                 content = await page.content()
-                if "Não foram encontrados dados" in content:
-                    result["mensagem"] = "nenhum_processo_encontrado"
-                    return result
-            
+                if "nenhum registro" in content.lower() or "não foram encontrados" in content.lower():
+                    break
+                    
+                await page.wait_for_timeout(1000)
+
+            if not found_results:
+                # DEBUG: Se não achou nada, retorna o HTML para entendermos
+                html_snapshot = await page.content()
+                result["mensagem"] = "nenhum_processo_encontrado_no_tempo_limite"
+                # Limita tamanho para não explodir o JSON
+                result["html_debug"] = html_snapshot[:20000] 
+                return result
+
+            # 6. Extração
+            proc_links = page.locator("a").filter(has_text=CNJ_RE)
             count = await proc_links.count()
             seen_nums = set()
 
@@ -277,7 +265,6 @@ async def scrape_pje(doc_digits: str, tipo: str) -> Dict[str, Any]:
 
                 partes = await extract_partes_from_row(link)
 
-                # Abre Popup
                 popup = await open_process_popup(page, link)
                 if popup:
                     meta = await extract_metadata(popup)
@@ -290,7 +277,6 @@ async def scrape_pje(doc_digits: str, tipo: str) -> Dict[str, Any]:
                     })
                     await popup.close()
                 else:
-                    # Tenta pegar dados da linha sem abrir popup se falhar
                     result["processos"].append({
                         "numero": numero,
                         "aviso": "popup_nao_abriu",
@@ -299,14 +285,11 @@ async def scrape_pje(doc_digits: str, tipo: str) -> Dict[str, Any]:
 
         except Exception as e:
             result["erro_interno"] = str(e)
-            # Tira print se der erro para debug (opcional, requer volume montado)
-            # await page.screenshot(path="error_trf6.png")
             
         finally:
             await browser.close()
 
     return result
-
 
 # ========= Endpoints =========
 
@@ -326,15 +309,14 @@ async def consulta(
         raise HTTPException(status_code=400, detail="documento_vazio")
 
     cache_key = f"trf6:{tipo}:{doc_digits}"
-    
-    # Check Cache
     cached = _cache.get(cache_key)
     if cached and (time.time() - cached["ts"]) < CACHE_TTL:
         return cached["data"]
 
     async with SEMA:
         try:
-            data = await asyncio.wait_for(scrape_pje(doc_digits, tipo), timeout=120)
+            # Aumentei timeout para 180s pois o scraping agora espera mais
+            data = await asyncio.wait_for(scrape_pje(doc_digits, tipo), timeout=180)
             _cache[cache_key] = {"ts": time.time(), "data": data}
             return data
         except asyncio.TimeoutError:
